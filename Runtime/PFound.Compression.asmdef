@@ -1,6 +1,6 @@
 {
-    "name": "PFound.Lzma",
-    "rootNamespace": "PFound.Lzma",
+    "name": "PFound.Compression",
+    "rootNamespace": "PFound.Compression",
     "references": [],
     "includePlatforms": [],
     "excludePlatforms": [],

@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 
-namespace PFound.Lzma
+namespace PFound.Compression
 {
     /// <summary>
     /// Clean-room LZMA codec (the LZMA1 algorithm family: a binary range coder over a literal / match model with
