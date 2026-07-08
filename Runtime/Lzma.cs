@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 
 namespace PFound.Compression
 {
@@ -42,20 +43,52 @@ namespace PFound.Compression
 
         // default literal/position context bits
         private const int Lc = 3, Lp = 0, Pb = 2;
-        private const int DictSize = 1 << 22; // 4 MB window
 
-        // Decoders are pooled: each carries the probability model state AND its reusable DictSize output window,
-        // reset (not reallocated) between uses — so concurrent multi-bundle decompression allocates neither the
-        // model arrays nor a per-bundle output buffer. Concurrency is capped by the caller (BundleProvisioner's
-        // decompress gate), which bounds how many windows are resident at once.
+        /// <summary>Default (and maximum) match-window / dictionary size a compress call uses: 4 MiB.</summary>
+        public const int DefaultDictionarySize = 1 << 22; // 4 MiB
+        /// <summary>Smallest dictionary size a compress call accepts: 256 KiB.</summary>
+        public const int MinDictionarySize = 1 << 18; // 256 KiB
+
+        // Decoders are pooled: each carries the probability model state AND its reusable output window (grown to the
+        // largest size seen and sized per-stream from the header dict field), reset (not reallocated) between uses —
+        // so concurrent multi-blob decompression allocates neither the model arrays nor a per-blob output buffer.
+        // Concurrency is capped by the caller, which bounds how many windows are resident at once.
         private static readonly ConcurrentBag<Decoder> s_decoderPool = new ConcurrentBag<Decoder>();
         private static Decoder RentDecoder() => s_decoderPool.TryTake(out var d) ? d : new Decoder();
         private static void ReturnDecoder(Decoder d) => s_decoderPool.Add(d);
 
+        /// <summary>Compresses with the default 4 MiB match window / dictionary size.</summary>
         public static byte[] Compress(byte[] data)
         {
             if (data == null) throw new ArgumentNullException(nameof(data));
-            return new Encoder().Run(data);
+            return new Encoder(DefaultDictionarySize).Run(data);
+        }
+
+        /// <summary>
+        /// Compresses with an explicit target dictionary / match-window size (<see cref="MinDictionarySize"/>..
+        /// <see cref="DefaultDictionarySize"/>, i.e. 256 KiB..4 MiB). The value is written into the .lzma header's
+        /// dict-size field and the encoder's match window is sized to it, so a smaller window trades ratio for a
+        /// smaller decode footprint. Any conforming LZMA-alone decoder (including this codec's) honours the field.
+        /// </summary>
+        public static byte[] Compress(byte[] data, int dictionarySize)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            if (dictionarySize < MinDictionarySize || dictionarySize > DefaultDictionarySize)
+                throw new ArgumentOutOfRangeException(nameof(dictionarySize));
+            return new Encoder(dictionarySize).Run(data);
+        }
+
+        /// <summary>
+        /// API-symmetry counterpart to <see cref="DecompressInto(Stream,Stream)"/>: reads <paramref name="source"/>
+        /// to its end, compresses, and writes the .lzma stream to <paramref name="destination"/>. The encoder needs
+        /// the whole payload to build its match model, so the source is buffered into an array internally.
+        /// </summary>
+        public static void Compress(Stream source, Stream destination)
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (destination == null) throw new ArgumentNullException(nameof(destination));
+            byte[] packed = new Encoder(DefaultDictionarySize).Run(ReadAll(source));
+            destination.Write(packed, 0, packed.Length);
         }
 
         /// <summary>Decompresses to a freshly-allocated array (the caller owns it). Uses a pooled decoder.</summary>
@@ -98,6 +131,100 @@ namespace PFound.Compression
             return checked((long)len);
         }
 
+        // ===================== FILE-PATH CONVENIENCE HELPERS =====================
+        // Thin wrappers that open the streams and delegate to the byte[]/stream core above. Path helpers exist for
+        // both directions (path <-> path, path <-> bytes) so callers never hand-roll File.Read/Write boilerplate.
+
+        /// <summary>Reads <paramref name="sourcePath"/>, compresses it, and writes the .lzma stream to <paramref name="destinationPath"/>.</summary>
+        public static void CompressFile(string sourcePath, string destinationPath)
+        {
+            if (sourcePath == null) throw new ArgumentNullException(nameof(sourcePath));
+            if (destinationPath == null) throw new ArgumentNullException(nameof(destinationPath));
+            File.WriteAllBytes(destinationPath, Compress(File.ReadAllBytes(sourcePath)));
+        }
+
+        /// <summary>Compresses a file with an explicit dictionary size (see <see cref="Compress(byte[],int)"/>).</summary>
+        public static void CompressFile(string sourcePath, string destinationPath, int dictionarySize)
+        {
+            if (sourcePath == null) throw new ArgumentNullException(nameof(sourcePath));
+            if (destinationPath == null) throw new ArgumentNullException(nameof(destinationPath));
+            File.WriteAllBytes(destinationPath, Compress(File.ReadAllBytes(sourcePath), dictionarySize));
+        }
+
+        /// <summary>Reads and compresses <paramref name="sourcePath"/>, returning the .lzma stream as bytes.</summary>
+        public static byte[] CompressFile(string sourcePath)
+        {
+            if (sourcePath == null) throw new ArgumentNullException(nameof(sourcePath));
+            return Compress(File.ReadAllBytes(sourcePath));
+        }
+
+        /// <summary>Compresses in-memory bytes straight to a file.</summary>
+        public static void CompressToFile(byte[] data, string destinationPath)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            if (destinationPath == null) throw new ArgumentNullException(nameof(destinationPath));
+            File.WriteAllBytes(destinationPath, Compress(data));
+        }
+
+        /// <summary>Decompresses <paramref name="sourcePath"/> straight to <paramref name="destinationPath"/>, streaming both ends.</summary>
+        public static void DecompressFile(string sourcePath, string destinationPath)
+        {
+            if (sourcePath == null) throw new ArgumentNullException(nameof(sourcePath));
+            if (destinationPath == null) throw new ArgumentNullException(nameof(destinationPath));
+            using (var src = File.OpenRead(sourcePath))
+            using (var dst = File.Create(destinationPath))
+                DecompressInto(src, dst);
+        }
+
+        /// <summary>Decompresses a file, returning the original bytes.</summary>
+        public static byte[] DecompressFile(string sourcePath)
+        {
+            if (sourcePath == null) throw new ArgumentNullException(nameof(sourcePath));
+            return Decompress(File.ReadAllBytes(sourcePath));
+        }
+
+        /// <summary>Decompresses in-memory bytes straight to a file.</summary>
+        public static void DecompressToFile(byte[] data, string destinationPath)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            if (destinationPath == null) throw new ArgumentNullException(nameof(destinationPath));
+            using (var dst = File.Create(destinationPath)) DecompressInto(data, dst);
+        }
+
+        // ===================== UTF-8 STRING HELPERS =====================
+
+        /// <summary>UTF-8 encodes <paramref name="text"/> and compresses the bytes.</summary>
+        public static byte[] CompressString(string text)
+        {
+            if (text == null) throw new ArgumentNullException(nameof(text));
+            return Compress(Encoding.UTF8.GetBytes(text));
+        }
+
+        /// <summary>UTF-8 encodes <paramref name="text"/> and compresses with an explicit dictionary size.</summary>
+        public static byte[] CompressString(string text, int dictionarySize)
+        {
+            if (text == null) throw new ArgumentNullException(nameof(text));
+            return Compress(Encoding.UTF8.GetBytes(text), dictionarySize);
+        }
+
+        /// <summary>Decompresses <paramref name="data"/> and decodes the result as a UTF-8 string.</summary>
+        public static string DecompressString(byte[] data)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            return Encoding.UTF8.GetString(Decompress(data));
+        }
+
+        // Drains a stream into a byte[] so the array-based encoder can consume it.
+        private static byte[] ReadAll(Stream source)
+        {
+            if (source is MemoryStream ms) return ms.ToArray();
+            using (var buffer = new MemoryStream())
+            {
+                source.CopyTo(buffer);
+                return buffer.ToArray();
+            }
+        }
+
         // probability helpers shared by encoder/decoder
         private static ushort[] NewProbs(int n)
         {
@@ -122,6 +249,9 @@ namespace PFound.Compression
         // ===================== ENCODER =====================
         private sealed class Encoder
         {
+            private readonly int _dictSize;
+            public Encoder(int dictSize) { _dictSize = dictSize; }
+
             private readonly List<byte> _out = new List<byte>();
             private ulong _low;
             private uint _range = 0xFFFFFFFF;
@@ -151,7 +281,7 @@ namespace PFound.Compression
                 int state = 0;
                 uint rep0 = 0; // last match distance, for the matched-literal context
                 int posMask = (1 << Pb) - 1;
-                var mf = new MatchFinder(data);
+                var mf = new MatchFinder(data, _dictSize);
 
                 int pos = 0;
                 while (pos < data.Length)
@@ -189,7 +319,7 @@ namespace PFound.Compression
             private void WriteHeader(long uncompressedLength)
             {
                 _out.Add((byte)((Pb * 5 + Lp) * 9 + Lc));
-                uint d = DictSize;
+                uint d = (uint)_dictSize;
                 for (int i = 0; i < 4; i++) _out.Add((byte)(d >> (8 * i)));
                 ulong u = (ulong)uncompressedLength;
                 for (int i = 0; i < 8; i++) _out.Add((byte)(u >> (8 * i)));
@@ -379,19 +509,24 @@ namespace PFound.Compression
             private byte Next() => (byte)_src.ReadByte();
 
             // --- sliding output window ---
-            // A circular DictSize buffer is the back-reference dictionary AND the only output buffer: decoded bytes
-            // are written here and flushed to the destination stream as the buffer fills, so peak memory is bounded
-            // to the window (~DictSize) regardless of the uncompressed size — never the whole bundle at once. Valid
-            // LZMA distances are < DictSize, so every back-reference still lives in the window. The buffer is a
-            // pooled-decoder field, allocated once and reused across bundles.
+            // A circular buffer is the back-reference dictionary AND the only output buffer: decoded bytes are
+            // written here and flushed to the destination stream as the buffer fills, so peak memory is bounded to
+            // the window regardless of the uncompressed size — never the whole payload at once. Valid LZMA distances
+            // are < the window size, so every back-reference still lives in the window. The window size is taken from
+            // the stream's own header dict-size field (capped at the uncompressed length, since no distance can
+            // exceed the bytes already emitted) — so this decoder handles any conforming LZMA-alone stream, not just
+            // 4 MiB-window ones. The backing array is a pooled-decoder field that GROWS to the largest size seen and
+            // is reused (never reallocated when the next stream needs an equal-or-smaller window) — the fast path.
             private byte[] _win;
+            private int _winSize;       // logical window size for this stream (backing array may be larger)
             private int _winPos;        // next write index in the window
             private int _winStreamPos;  // window index up to which bytes have been flushed to _dst
             private Stream _dst;
 
-            private void WinInit(Stream dst)
+            private void WinInit(Stream dst, int winSize)
             {
-                if (_win == null) _win = new byte[DictSize];
+                _winSize = winSize;
+                if (_win == null || _win.Length < winSize) _win = new byte[winSize];
                 _winPos = 0;
                 _winStreamPos = 0;
                 _dst = dst;
@@ -401,33 +536,33 @@ namespace PFound.Compression
             {
                 int size = _winPos - _winStreamPos;
                 if (size > 0) _dst.Write(_win, _winStreamPos, size);
-                if (_winPos >= DictSize) _winPos = 0;
+                if (_winPos >= _winSize) _winPos = 0;
                 _winStreamPos = _winPos;
             }
 
             private void WinPut(byte b)
             {
                 _win[_winPos++] = b;
-                if (_winPos >= DictSize) WinFlush();
+                if (_winPos >= _winSize) WinFlush();
             }
 
             private byte WinGet(int distance)
             {
                 int i = _winPos - distance - 1;
-                if (i < 0) i += DictSize;
+                if (i < 0) i += _winSize;
                 return _win[i];
             }
 
             private void WinCopyMatch(int distance, int len)
             {
                 int i = _winPos - distance - 1;
-                if (i < 0) i += DictSize;
+                if (i < 0) i += _winSize;
                 for (; len > 0; len--)
                 {
-                    if (i >= DictSize) i = 0;
+                    if (i >= _winSize) i = 0;
                     byte b = _win[i++];
                     _win[_winPos++] = b;
-                    if (_winPos >= DictSize) WinFlush();
+                    if (_winPos >= _winSize) WinFlush();
                 }
             }
 
@@ -443,6 +578,7 @@ namespace PFound.Compression
             private readonly ushort[] _literal = NewProbs((1 << (Lc + Lp)) * 0x300);
             private readonly LenDec _len = new LenDec();
             private readonly LenDec _repLen = new LenDec();
+            private uint _dictSize; // window size declared by the stream header
 
             private static ushort[][] JaggedD(int a, int b)
             {
@@ -473,7 +609,9 @@ namespace PFound.Compression
                 _code = 0;
 
                 Next();              // props byte (lc/lp/pb fixed in this codec)
-                for (int i = 0; i < 4; i++) Next(); // dict size (fixed window)
+                uint dict = 0;       // dict size: sizes the output/back-reference window (honored, not ignored)
+                for (int i = 0; i < 4; i++) dict |= (uint)Next() << (8 * i);
+                _dictSize = dict;
                 ulong outLen = 0;
                 for (int i = 0; i < 8; i++) outLen |= (ulong)Next() << (8 * i);
 
@@ -491,7 +629,11 @@ namespace PFound.Compression
 
             private void Body(Stream dst, int total)
             {
-                WinInit(dst);
+                // The window need never exceed the total output (no distance can reach past byte 0), so cap the
+                // declared dict size by the total — this both honors a smaller-than-4-MiB header and keeps a huge
+                // declared dict (some encoders write 0xFFFFFFFF) from over-allocating. Floor of 1 for empty streams.
+                int winSize = (int)Math.Max(1L, Math.Min((long)_dictSize, (long)total));
+                WinInit(dst, winSize);
                 int outPos = 0;
 
                 int state = 0;
@@ -697,15 +839,17 @@ namespace PFound.Compression
         private sealed class MatchFinder
         {
             private readonly byte[] _data;
+            private readonly int _dictSize;
             private readonly int[] _head;
             private readonly int[] _prev;
             private const int HashBits = 16;
             private const int HashSize = 1 << HashBits;
             private const int MaxChain = 128;
 
-            public MatchFinder(byte[] data)
+            public MatchFinder(byte[] data, int dictSize)
             {
                 _data = data;
+                _dictSize = dictSize;
                 _head = new int[HashSize];
                 _prev = new int[data.Length + 1];
                 for (int i = 0; i < HashSize; i++) _head[i] = -1;
@@ -730,7 +874,7 @@ namespace PFound.Compression
 
                 int cur = _head[h];
                 int chain = MaxChain;
-                int minPos = Math.Max(0, pos - DictSize);
+                int minPos = Math.Max(0, pos - _dictSize);
                 while (cur >= minPos && chain-- > 0)
                 {
                     int len = 0;
